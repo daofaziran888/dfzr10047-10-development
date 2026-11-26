@@ -100,6 +100,126 @@ class TmplDiffService(BaseModuleService):
                 return self._int_value(row.get("影响批次数"))
         return 0
 
+    # ---- 渠道采用单联动 -----------------------------------------------
+    def find_diff_by_versions(self, old_version: str,
+                              new_version: str) -> dict[str, Any] | None:
+        for row in store.rows(self.MODULE):
+            if (row.get("旧模板版本") == old_version
+                    and row.get("新模板版本") == new_version):
+                return row
+        return None
+
+    def register_adoption_diff(self, diff_no: str, old_version: str,
+                               new_version: str, changed_fields: list[str],
+                               batch_no: str, adoption_no: str,
+                               register_time: str) -> dict[str, Any]:
+        """渠道采用单触发的差异条目：记录来源批次与关联采用单，初始待比对。"""
+        rows = store.rows(self.MODULE)
+        target = next((r for r in rows if r.get("差异编号") == diff_no), None)
+        if target is None:
+            entry_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+            target = {"id": entry_id, "差异编号": diff_no}
+            rows.append(target)
+        target.update({
+            "旧模板版本": old_version,
+            "新模板版本": new_version,
+            "差异字段": ",".join(changed_fields),
+            "差异类别": f"渠道采用{len(changed_fields)}" if changed_fields else "渠道采用",
+            "影响批次数": "1",
+            "修正方案": "渠道采用单待模板差异页复核",
+            "登记时间": register_time,
+            "来源批次": batch_no,
+            "关联采用单": adoption_no,
+            "受影响渠道": "",
+            "差异字段数": str(len(changed_fields)),
+            "status": "待比对",
+            "pending": True,
+            "abnormal": False,
+        })
+        return target
+
+    def link_adoption(self, diff_no: str, batch_no: str,
+                      adoption_no: str) -> tuple[bool, str]:
+        """把新的采用单挂到差异条目：来源批次与关联采用单逐条累积，可追回真实批次。"""
+        for row in store.rows(self.MODULE):
+            if row.get("差异编号") != diff_no:
+                continue
+            batches = self._split_field(row.get("来源批次"))
+            if batch_no and batch_no not in batches:
+                batches.append(batch_no)
+            adoptions = self._split_field(row.get("关联采用单"))
+            if adoption_no and adoption_no not in adoptions:
+                adoptions.append(adoption_no)
+            channels = self._split_field(row.get("受影响渠道"))
+            for adoption in store.rows("tmpl_adopt"):
+                if adoption.get("采用单号") in adoptions:
+                    channel = str(adoption.get("采用渠道") or "")
+                    if channel and channel not in channels:
+                        channels.append(channel)
+            row["来源批次"] = ",".join(batches)
+            row["关联采用单"] = ",".join(adoptions)
+            row["受影响渠道"] = ",".join(channels)
+            if len(batches) > 1:
+                row["影响批次数"] = str(len(batches))
+            return True, (
+                f"差异 {diff_no} 已关联采用单 {adoption_no}，来源批次 {batch_no}"
+            )
+        return False, f"差异条目 {diff_no} 不存在"
+
+    @staticmethod
+    def _split_field(value: Any) -> list[str]:
+        return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
+    def source_batches_of(self, diff_no: str) -> list[str]:
+        """差异条目可追溯的来源批次清单，用于确认差异实际涵盖哪批。"""
+        for row in store.rows(self.MODULE):
+            if row.get("差异编号") == diff_no:
+                return self._split_field(row.get("来源批次"))
+        return []
+
+    def adoptions_of_diff(self, diff_no: str) -> list[dict[str, Any]]:
+        """差异条目关联的全部采用单，供差异页核对受影响渠道。"""
+        for row in store.rows(self.MODULE):
+            if row.get("差异编号") != diff_no:
+                continue
+            numbers = set(self._split_field(row.get("关联采用单")))
+            return [
+                dict(adoption) for adoption in store.rows("tmpl_adopt")
+                if adoption.get("采用单号") in numbers
+            ]
+        return []
+
+    def adoption_review(self, adoption_no: str) -> dict[str, Any]:
+        """模板差异页按采用单复核：返回受影响渠道、版本、表达式与实际来源批次。"""
+        adoption = next(
+            (r for r in store.rows("tmpl_adopt") if r.get("采用单号") == adoption_no),
+            None)
+        if adoption is None:
+            return {"采用单号": adoption_no, "ok": False, "message": "采用单不存在"}
+        diff_no = str(adoption.get("差异编号") or "")
+        diff = next(
+            (r for r in store.rows(self.MODULE) if r.get("差异编号") == diff_no),
+            None)
+        linked = self.adoptions_of_diff(diff_no) if diff else []
+        return {
+            "采用单号": adoption_no,
+            "ok": True,
+            "采用渠道": adoption.get("采用渠道"),
+            "关联批次": adoption.get("关联批次"),
+            "模板编号": adoption.get("模板编号"),
+            "派生版本": adoption.get("派生版本"),
+            "金额表达式": adoption.get("金额表达式"),
+            "差异编号": diff_no,
+            "旧模板版本": diff.get("旧模板版本") if diff else "",
+            "新模板版本": diff.get("新模板版本") if diff else "",
+            "来源批次": self.source_batches_of(diff_no),
+            "受影响渠道": sorted({
+                str(a.get("采用渠道")) for a in linked if a.get("采用渠道")
+            }),
+            "关联采用单": [a.get("采用单号") for a in linked],
+            "status": adoption.get("status"),
+        }
+
     @staticmethod
     def _int_value(value: Any) -> int:
         text = str(value or "").strip()

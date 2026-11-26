@@ -2507,3 +2507,507 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 渠道借用派生模板：采用单、撤回共享、批次领取与历史解析保全
+# ======================================================================
+
+class TestTmplGrantService:
+    def test_active_grant_covers_batch_in_range(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        ok, msg, grant, code = svc.validate_grant(
+            "ET-007", "contract-b", "FI-CONTRACT-B-002")
+        assert ok is True
+        assert code == ""
+        assert grant["授权编号"] == "G-001"
+
+    def test_batch_outside_range_rejected(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        # G-002 已撤回，即使范围内也不可用；改用 G-001 的超范围批次验证范围判定
+        ok, msg, _grant, code = svc.validate_grant(
+            "ET-007", "contract-b", "FI-CONTRACT-ZZZ")
+        assert ok is False
+        assert code == "超范围"
+        assert "不在授权" in msg
+
+    def test_other_channel_grant_is_unauthorized(self, fresh_store):
+        """丙申请乙的派生模板属于借用他人授权，服务端判定越权。"""
+        svc = SERVICES["tmpl_grant"]
+        ok, msg, grant, code = svc.validate_grant(
+            "ET-007", "contract-c", "FI-CONTRACT-C-001")
+        assert ok is False
+        assert code == "越权"
+        assert grant is None
+        assert "contract-b" in msg
+
+    def test_revoked_grant_cannot_cover_new_batch(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        ok, msg, _grant, code = svc.validate_grant(
+            "ET-008", "contract-b", "FI-CONTRACT-B-001")
+        assert ok is False
+        assert code == "已撤回"
+        assert "撤回后不可再用于新批次" in msg
+
+    def test_revoke_keeps_claimed_in_flight(self, fresh_store):
+        """撤回共享后，撤回前已领取的在途批次继续可用。"""
+        svc = SERVICES["tmpl_grant"]
+        ok, msg, grant = svc.revoke(
+            "G-001", "2026-09-05T09:00:00", "合同口径调整")
+        assert ok is True
+        assert grant["status"] == "已撤回"
+        receipt = svc.revocation_receipt("G-001")
+        assert receipt["在途批次"] == ["FI-CONTRACT-B-002"]
+        assert "继续" in receipt["在途结论"]
+        assert receipt["撤回回执编号"] == "GR-G-001"
+
+    def test_revoke_receipt_points_next_batch_to_allowed_expression(self, fresh_store):
+        """撤回回执返回下一批服务端准许的版本与实用表达式。"""
+        svc = SERVICES["tmpl_grant"]
+        svc.revoke("G-001", "2026-09-05T09:00:00", "r")
+        receipt = svc.revocation_receipt("G-001")
+        assert receipt["下一批"] == "FI-CONTRACT-B-003"
+        assert receipt["下一批模板编号"] == "ET-006"
+        assert receipt["下一批派生版本"] == "v1.0.0"
+        assert receipt["下一批金额表达式"] == "gross_amount = $.gross_amount"
+        assert "不得再采用 ET-007" in receipt["下一步"]
+
+    def test_scope_report_shows_three_ranges(self, fresh_store):
+        """模板确认步骤要区分已授权、已领取、撤回后不可再用的范围。"""
+        svc = SERVICES["tmpl_grant"]
+        svc.revoke("G-001", "2026-09-05T09:00:00", "r")
+        report = svc.scope_report("G-001")
+        assert report["已授权"]["仍有效"] is False
+        assert report["已领取"] == ["FI-CONTRACT-B-002"]
+        assert "FI-CONTRACT-B-003" in report["撤回后不可再用"]
+
+    def test_scope_active_before_revoke_lists_pending(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        report = svc.scope_report("G-001")
+        assert report["撤回后不可再用"] == []
+        assert "FI-CONTRACT-B-003" in report["待领取"]
+
+    def test_resume_in_flight_batch_keeps_version(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        svc.revoke("G-001", "2026-09-05T09:00:00", "r")
+        resume = svc.resume_batch("contract-b", "FI-CONTRACT-B-002")
+        assert resume["允许继续"] is True
+        assert resume["派生版本"] == "v2.0.0"
+        assert resume["撤回后沿用"] is True
+        assert "不换版" in resume["下一步"]
+
+    def test_resume_next_batch_after_revoke_uses_allowed_grant(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        svc.revoke("G-001", "2026-09-05T09:00:00", "r")
+        resume = svc.resume_batch("contract-b", "FI-CONTRACT-B-003")
+        assert resume["模板编号"] == "ET-006"
+        assert resume["派生版本"] == "v1.0.0"
+        assert resume["允许继续"] is True
+
+    def test_run_action_revoke_generates_receipt(self, fresh_store):
+        svc = SERVICES["tmpl_grant"]
+        row = next(r for r in store.rows("tmpl_grant") if r["授权编号"] == "G-001")
+        entry, msg = svc.run_action(row["id"], "撤回共享")
+        assert entry is not None
+        assert entry["status"] == "已撤回"
+        assert "撤回回执" in msg
+
+
+class TestTmplAdoptService:
+    def test_form_creates_reviewable_adoption(self, fresh_store):
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, entry = svc.submit_adoption(
+            "AD-T1", "contract-b", "ET-007", "FI-CONTRACT-B-003",
+            "2026-09-05T10:00:00")
+        assert ok is True
+        assert entry["status"] == "待复核"
+        assert entry["差异编号"].startswith("TD-")
+        assert entry["金额表达式"] == "net_amount = gross_amount * 0.85"
+
+    def test_create_entry_form_path(self, fresh_store):
+        """抽取模板页采用表单走 create_entry，服务端核对后返回采用单。"""
+        svc = SERVICES["tmpl_adopt"]
+        entry, missing = svc.create_entry({
+            "采用渠道": "contract-b",
+            "模板编号": "ET-007",
+            "关联批次": "FI-CONTRACT-B-003",
+            "申请时间": "2026-09-05T10:00:00",
+        })
+        assert missing == []
+        assert entry is not None
+        assert entry["采用单号"].startswith("AD-")
+        assert entry["采用渠道"] == "contract-b"
+
+    def test_unauthorized_channel_cannot_adopt(self, fresh_store):
+        """未授权更新丙的命中范围属于越权，直接拒绝。"""
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, entry = svc.submit_adoption(
+            "AD-T2", "contract-c", "ET-007", "FI-CONTRACT-C-001",
+            "2026-09-05T10:00:00")
+        assert ok is False
+        assert entry is None
+        assert "越权" in msg
+
+    def test_cannot_push_adoption_onto_other_channel_batch(self, fresh_store):
+        """乙用甲的派生授权把采用单提交到丙的批次，属于越权。"""
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, entry = svc.submit_adoption(
+            "AD-T3", "contract-b", "ET-007", "FI-CONTRACT-C-001",
+            "2026-09-05T10:00:00")
+        assert ok is False
+        assert entry is None
+        assert "越权" in msg
+
+    def test_rejected_attempt_recorded(self, fresh_store):
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, record = svc.submit_and_reject(
+            "AD-T4", "contract-c", "ET-007", "FI-CONTRACT-C-001",
+            "2026-09-05T10:00:00")
+        assert ok is False
+        assert record["status"] == "已拒绝"
+        rejected = svc.rejected_batches("contract-c")
+        assert any(r["采用单号"] == "AD-T4" for r in rejected)
+
+    def test_same_batch_cannot_mix_two_versions(self, fresh_store):
+        """B-002 已领取 v2.0.0，再申请 v1.0.0 属于把两版产物拼成同一次解析。"""
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, _entry = svc.submit_adoption(
+            "AD-T5", "contract-b", "ET-006", "FI-CONTRACT-B-002",
+            "2026-09-05T10:00:00")
+        assert ok is False
+        assert "一致的模板数据" in msg
+
+    def test_adopt_creates_claim_and_pins_batch(self, fresh_store):
+        svc = SERVICES["tmpl_adopt"]
+        _ok, _msg, entry = svc.submit_adoption(
+            "AD-T6", "contract-b", "ET-007", "FI-CONTRACT-B-003", "t")
+        ok, msg, updated = svc.adopt("AD-T6", "2026-09-05T11:00:00")
+        assert ok is True
+        assert updated["status"] == "已采纳"
+        claim = SERVICES["tmpl_claim"].claim_of_batch("FI-CONTRACT-B-003")
+        assert claim["模板版本"] == "v2.0.0"
+        assert claim["采用单号"] == "AD-T6"
+
+    def test_adopt_revalidates_after_revoke(self, fresh_store):
+        """采用单生成后授权被撤回，确认采用时必须重新核对并拒绝。"""
+        adopt = SERVICES["tmpl_adopt"]
+        grant = SERVICES["tmpl_grant"]
+        adopt.submit_adoption("AD-T7", "contract-b", "ET-007",
+                              "FI-CONTRACT-B-003", "t")
+        grant.revoke("G-001", "2026-09-05T09:00:00", "r")
+        ok, msg, entry = adopt.adopt("AD-T7", "2026-09-05T11:00:00")
+        assert ok is False
+        assert entry["status"] == "已拒绝"
+        assert "撤回" in msg
+
+    def test_review_scope_reports_channel_and_batch(self, fresh_store):
+        svc = SERVICES["tmpl_adopt"]
+        scope = svc.review_scope("AD-002")
+        assert scope["采用渠道"] == "contract-b"
+        assert scope["关联批次"] == "FI-CONTRACT-B-002"
+        assert scope["派生版本"] == "v2.0.0"
+
+    def test_duplicate_adoption_rejected(self, fresh_store):
+        svc = SERVICES["tmpl_adopt"]
+        ok, msg, _e = svc.submit_adoption(
+            "AD-002", "contract-b", "ET-007", "FI-CONTRACT-B-002", "t")
+        assert ok is False
+        assert "已存在" in msg
+
+
+class TestTmplClaimService:
+    def test_claim_rejects_second_version_same_batch(self, fresh_store):
+        svc = SERVICES["tmpl_claim"]
+        ok, msg, _claim = svc.claim_batch(
+            "FI-CONTRACT-B-002", "contract-b", "ET-006", "v1.0.0",
+            "gross_amount = $.gross_amount", "AD-T", "t")
+        assert ok is False
+        assert "一致的模板数据" in msg
+
+    def test_claim_same_version_is_idempotent(self, fresh_store):
+        svc = SERVICES["tmpl_claim"]
+        ok, _msg, claim = svc.claim_batch(
+            "FI-CONTRACT-B-002", "contract-b", "ET-007", "v2.0.0",
+            "net_amount = gross_amount * 0.85", "AD-002", "t")
+        assert ok is True
+        assert claim["模板版本"] == "v2.0.0"
+
+    def test_pending_claim_filled_once(self, fresh_store):
+        svc = SERVICES["tmpl_claim"]
+        ok, _msg, claim = svc.claim_batch(
+            "FI-CONTRACT-B-003", "contract-b", "ET-006", "v1.0.0",
+            "gross_amount = $.gross_amount", "AD-T8", "t")
+        assert ok is True
+        assert claim["status"] == "已领取"
+        assert claim["关联批次"] == "FI-CONTRACT-B-003"
+
+    def test_channel_summary_groups_versions(self, fresh_store):
+        svc = SERVICES["tmpl_claim"]
+        summary = svc.channel_summary("contract-b")
+        assert summary["领取数"] >= 2
+        assert "ET-007[v2.0.0]" in summary["版本分布"]
+
+
+class TestFieldParseAdoption:
+    def test_parse_uses_batch_adoption_record(self, fresh_store):
+        """字段解析使用批次来源采用记录解析字段，并冻结当次版本。"""
+        svc = SERVICES["field_parse"]
+        ok, msg, fields = svc.parse_fields_for_batch(
+            "FP-B2", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        assert ok is True
+        assert fields[0]["模板版本"] == "v2.0.0"
+        assert fields[0]["金额表达式"] == "net_amount = gross_amount * 0.85"
+        assert svc.historical_versions_of_batch("FI-CONTRACT-B-002") == ["v2.0.0"]
+
+    def test_parse_refuses_when_no_adoption(self, fresh_store):
+        svc = SERVICES["field_parse"]
+        ok, msg, fields = svc.parse_fields_for_batch(
+            "FP-C1", "FI-CONTRACT-C-001", [{"gross_amount": "1"}], 1, "t")
+        assert ok is False
+        assert fields == []
+        assert "没有已采纳的采用记录" in msg
+
+    def test_historical_version_not_rewritten(self, fresh_store):
+        """历史解析字段仍保留当时的模板版本，后续模板变动不影响旧记录。"""
+        svc = SERVICES["field_parse"]
+        svc.parse_fields_for_batch(
+            "FP-B2", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        before = [dict(r) for r in store.rows("field_parse")
+                  if r.get("关联批次") == "FI-CONTRACT-B-002"]
+        # 模拟模板换版：把模板版本号改到新版本
+        tmpl = next(r for r in store.rows("extract_tmpl") if r["模板编号"] == "ET-007")
+        tmpl["版本号"] = "v9.0.0"
+        after = [r for r in store.rows("field_parse")
+                 if r.get("关联批次") == "FI-CONTRACT-B-002"]
+        assert all(r["模板版本"] == "v2.0.0" for r in after)
+        assert before == [dict(r) for r in after]
+
+    def test_record_parsed_field_keeps_version(self, fresh_store):
+        svc = SERVICES["field_parse"]
+        entry = svc.record_parsed_field(
+            "FP-X9", "FI-X9", "ET-007", "gross_amount", "100", "85", 1, 1,
+            True, template_version="v2.0.0", expression="net_amount = gross*0.85")
+        assert entry["模板版本"] == "v2.0.0"
+        assert entry["金额表达式"] == "net_amount = gross*0.85"
+
+
+class TestParseBatchSingleTemplate:
+    def test_mixed_versions_blocked(self, fresh_store):
+        """同一批次发布不能把两个表达式的产物拼成同一次解析。"""
+        svc = SERVICES["parse_batch"]
+        store.rows("field_parse").append({
+            "id": 990, "status": "解析成功", "pending": False, "abnormal": False,
+            "解析编号": "FP-MIX", "关联批次": "FI-CONTRACT-B-002",
+            "命中模板": "ET-006", "模板版本": "v1.0.0",
+            "字段名称": "gross_amount", "原始取值": "100", "解析取值": "100",
+            "解析耗时": "1", "解析行号": "1"})
+        ok, msg = svc.assert_single_template("FI-CONTRACT-B-002")
+        assert ok is False
+        assert "一致的模板数据" in msg
+
+    def test_single_version_passes(self, fresh_store):
+        svc = SERVICES["parse_batch"]
+        ok, msg = svc.assert_single_template("FI-CONTRACT-B-002")
+        assert ok is True
+        assert "v2.0.0" in msg
+
+
+class TestTmplDiffAdoption:
+    def test_adoption_review_lists_affected_channel(self, fresh_store):
+        svc = SERVICES["tmpl_diff"]
+        review = svc.adoption_review("AD-002")
+        assert review["ok"] is True
+        assert review["受影响渠道"] == ["contract-b"]
+        assert review["来源批次"] == ["FI-CONTRACT-B-002"]
+
+    def test_new_adoption_links_source_batch(self, fresh_store):
+        adopt = SERVICES["tmpl_adopt"]
+        diff = SERVICES["tmpl_diff"]
+        ok, _msg, entry = adopt.submit_adoption(
+            "AD-T9", "contract-b", "ET-007", "FI-CONTRACT-B-003", "t")
+        assert ok is True
+        diff_no = entry["差异编号"]
+        assert "FI-CONTRACT-B-003" in diff.source_batches_of(diff_no)
+        channels = {a["采用渠道"] for a in diff.adoptions_of_diff(diff_no)}
+        assert "contract-b" in channels
+
+    def test_diff_links_same_pair_once(self, fresh_store):
+        adopt = SERVICES["tmpl_adopt"]
+        diff = SERVICES["tmpl_diff"]
+        _ok, _m, first = adopt.submit_adoption(
+            "AD-TA", "contract-b", "ET-007", "FI-CONTRACT-B-003", "t")
+        _ok2, _m2, second = adopt.submit_adoption(
+            "AD-TB", "contract-b", "ET-007", "FI-CONTRACT-B-001", "t")
+        # B-001 已领取 v1.0.0，不能混版 → 第二个被拒
+        assert second is None
+        assert diff.find_diff_by_versions("v1.0.0", "v2.0.0") is not None
+
+
+class TestReparseAffectedByConsumedVersion:
+    def test_plan_uses_real_consumed_version(self, fresh_store):
+        """重解析申请以当次真实消费版本和字段差异定位受影响批次。"""
+        fp = SERVICES["field_parse"]
+        rp = SERVICES["reparse_task"]
+        fp.parse_fields_for_batch(
+            "FP-B2", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        ok, msg, task = rp.plan_from_adoption(
+            "RT-T1", "TD-005", "旧投递保留",
+            {"FI-CONTRACT-B-002": "2026-09-04"})
+        assert ok is True
+        assert "FI-CONTRACT-B-002:v2.0.0" in task["真实消费版本"]
+        assert task["差异字段"] == "net_amount"
+        assert task["差异编号"] == "TD-005"
+
+    def test_affected_by_diff_traces_source_batch(self, fresh_store):
+        rp = SERVICES["reparse_task"]
+        affected = rp.affected_by_diff("TD-005")
+        assert [a["关联批次"] for a in affected] == ["FI-CONTRACT-B-002"]
+        assert affected[0]["采用渠道"] == "contract-b"
+        assert affected[0]["真实消费版本"] == "v2.0.0"
+
+    def test_unknown_diff_no_task(self, fresh_store):
+        rp = SERVICES["reparse_task"]
+        ok, msg, task = rp.plan_from_adoption("RT-T2", "TD-NOPE", "旧投递保留", {})
+        assert ok is False
+        assert task is None
+
+    def test_old_outputs_not_rewritten_by_reparse(self, fresh_store):
+        """旧输出（历史字段解析）在重解析完成后未被改写。"""
+        fp = SERVICES["field_parse"]
+        rp = SERVICES["reparse_task"]
+        fp.parse_fields_for_batch(
+            "FP-B2", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        before = [dict(r) for r in store.rows("field_parse")
+                  if r.get("关联批次") == "FI-CONTRACT-B-002"]
+        rp.plan_from_adoption("RT-T3", "TD-005", "旧投递保留",
+                              {"FI-CONTRACT-B-002": "2026-09-04"})
+        rp.start_task("RT-T3")
+        rp.complete_task("RT-T3", 1, "done")
+        after = [dict(r) for r in store.rows("field_parse")
+                 if r.get("关联批次") == "FI-CONTRACT-B-002"]
+        assert before == after
+
+
+class TestAdoptionEndToEndStory:
+    def test_full_story(self, fresh_store):
+        """乙先用甲派生的 net 版本解析，随后甲撤回，另外直接提交到丙被拒。
+
+        核对：丙被拒、乙在途与下一批各用哪版、差异实际涵盖哪批、旧输出未被改写。
+        """
+        grant = SERVICES["tmpl_grant"]
+        adopt = SERVICES["tmpl_adopt"]
+        fp = SERVICES["field_parse"]
+        diff = SERVICES["tmpl_diff"]
+        rp = SERVICES["reparse_task"]
+        pb = SERVICES["parse_batch"]
+
+        # 1. 乙在途批次 B-002 用 net v2.0.0 解析
+        ok, msg, _ = fp.parse_fields_for_batch(
+            "FP-B2", "FI-CONTRACT-B-002", [{"gross_amount": "200"}], 1, "t")
+        assert ok is True
+        old_fields = [dict(r) for r in store.rows("field_parse")
+                      if r.get("关联批次") == "FI-CONTRACT-B-002"]
+
+        # 2. 甲撤回对乙的 net 共享
+        ok, _msg, _g = grant.revoke("G-001", "2026-09-05T09:00:00", "口径调整")
+        assert ok is True
+        receipt = grant.revocation_receipt("G-001")
+        assert receipt["在途批次"] == ["FI-CONTRACT-B-002"]
+        assert receipt["下一批"] == "FI-CONTRACT-B-003"
+        assert receipt["下一批派生版本"] == "v1.0.0"
+
+        # 3. 撤回后直接提交采用到丙 → 越权被拒
+        ok, msg, record = adopt.submit_and_reject(
+            "AD-C1", "contract-c", "ET-007", "FI-CONTRACT-C-001", "t")
+        assert ok is False
+        assert "越权" in msg
+        assert record["status"] == "已拒绝"
+
+        # 4. 乙返回在途批次：继续用 v2.0.0，不换版
+        resume = grant.resume_batch("contract-b", "FI-CONTRACT-B-002")
+        assert resume["派生版本"] == "v2.0.0"
+        assert resume["允许继续"] is True
+
+        # 5. 乙下一批 B-003 改用 v1.0.0 的 gross 表达式
+        next_resume = grant.resume_batch("contract-b", "FI-CONTRACT-B-003")
+        assert next_resume["模板编号"] == "ET-006"
+        assert next_resume["金额表达式"] == "gross_amount = $.gross_amount"
+
+        # 6. 差异页按同一采用单核对受影响渠道，差异只涵盖真实来源批次
+        review = diff.adoption_review("AD-002")
+        assert review["受影响渠道"] == ["contract-b"]
+        assert review["来源批次"] == ["FI-CONTRACT-B-002"]
+        affected = rp.affected_by_diff("TD-005")
+        assert [a["关联批次"] for a in affected] == ["FI-CONTRACT-B-002"]
+
+        # 7. 单批模板一致，旧输出未被改写
+        assert pb.assert_single_template("FI-CONTRACT-B-002")[0] is True
+        rp.plan_from_adoption("RT-STORY", "TD-005", "旧投递保留",
+                              {"FI-CONTRACT-B-002": "2026-09-04"})
+        rp.complete_task("RT-STORY", 1, "done")
+        after = [dict(r) for r in store.rows("field_parse")
+                 if r.get("关联批次") == "FI-CONTRACT-B-002"]
+        assert after == old_fields
+
+    def test_both_channels_scopes_distinct(self, fresh_store):
+        """模板确认步骤按渠道列出三类范围，乙的撤回范围不影响甲的授权。"""
+        grant = SERVICES["tmpl_grant"]
+        grant.revoke("G-001", "2026-09-05T09:00:00", "r")
+        b_scopes = grant.scopes_of_channel("contract-b")
+        a_scopes = grant.scopes_of_channel("contract-a")
+        assert b_scopes["撤回后不可再用"]
+        assert a_scopes["撤回后不可再用"] == []
+        assert any(item["关联批次"] == "FI-CONTRACT-B-002"
+                   for item in b_scopes["已领取"])
+
+
+class TestPartialReadBatchGuards:
+    def test_partially_read_batch_cannot_switch_expression(self, fresh_store):
+        """已读入部分样本的同一批面临两种获准过的表达式时，必须拒绝混用。"""
+        adopt = SERVICES["tmpl_adopt"]
+        fp = SERVICES["field_parse"]
+        # 先用已领取的 v2.0.0 读入部分样本
+        ok, _msg, _fields = fp.parse_fields_for_batch(
+            "FP-PART", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        assert ok is True
+        # 同批再申请另一个曾获准过的表达式 v1.0.0
+        ok2, msg2, entry2 = adopt.submit_adoption(
+            "AD-PART", "contract-b", "ET-006", "FI-CONTRACT-B-002", "t")
+        assert ok2 is False
+        assert entry2 is None
+        assert "一致的模板数据" in msg2
+        # 已读入的字段保持原版本
+        versions = fp.historical_versions_of_batch("FI-CONTRACT-B-002")
+        assert versions == ["v2.0.0"]
+
+    def test_same_expression_partial_read_can_continue(self, fresh_store):
+        fp = SERVICES["field_parse"]
+        fp.parse_fields_for_batch(
+            "FP-P1", "FI-CONTRACT-B-002", [{"gross_amount": "100"}], 1, "t")
+        ok, msg, fields = fp.parse_fields_for_batch(
+            "FP-P2", "FI-CONTRACT-B-002", [{"gross_amount": "200"}], 2, "t2")
+        assert ok is True
+        assert fields[0]["模板版本"] == "v2.0.0"
+
+    def test_in_flight_continue_after_revoke_does_not_need_new_adoption(
+            self, fresh_store):
+        """撤回后在途批次沿用原版本继续解析，不会因授权撤回被误拒。"""
+        grant = SERVICES["tmpl_grant"]
+        fp = SERVICES["field_parse"]
+        grant.revoke("G-001", "2026-09-05T09:00:00", "r")
+        ok, msg, fields = fp.parse_fields_for_batch(
+            "FP-INFLIGHT", "FI-CONTRACT-B-002", [{"gross_amount": "150"}], 3, "t")
+        assert ok is True
+        assert fields[0]["模板版本"] == "v2.0.0"
+        assert fields[0]["金额表达式"] == "net_amount = gross_amount * 0.85"
+
+    def test_next_batch_after_revoke_cannot_reuse_withdrawn_version(
+            self, fresh_store):
+        """撤回后下一批不得再用被撤回的 v2.0.0。"""
+        grant = SERVICES["tmpl_grant"]
+        adopt = SERVICES["tmpl_adopt"]
+        grant.revoke("G-001", "2026-09-05T09:00:00", "r")
+        ok, msg, _entry = adopt.submit_adoption(
+            "AD-NEXT", "contract-b", "ET-007", "FI-CONTRACT-B-003", "t")
+        assert ok is False
+        assert "撤回后不可再用于新批次" in msg

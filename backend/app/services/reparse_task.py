@@ -208,3 +208,96 @@ class ReparseTaskService(BaseModuleService):
             for r in store.rows(self.MODULE)
             if r.get("status") in ("待执行", "执行中")
         ]
+
+    # ---- 按真实消费版本与字段差异定位受影响批次 -----------------------
+    def batches_consumed_version(self, template_no: str,
+                                 version: str) -> list[str]:
+        """真正用该模板版本解析过的批次：字段解析明细里冻结的版本才算真实消费。"""
+        consumed: list[str] = []
+        for field in store.rows("field_parse"):
+            if (field.get("命中模板") == template_no
+                    and field.get("模板版本") == version
+                    and field.get("关联批次")):
+                batch = str(field.get("关联批次"))
+                if batch not in consumed:
+                    consumed.append(batch)
+        return sorted(consumed)
+
+    def affected_by_diff(self, diff_no: str) -> list[dict[str, Any]]:
+        """按差异条目的来源批次定位受影响批次，并给出各批次的真实消费版本。
+
+        重解析申请以当次真实消费版本和字段差异定位受影响批次：
+        只把确实消费了旧版本的批次纳入重解析范围，避免误伤未触碰批次的旧输出。
+        """
+        from app.services import service_for
+
+        diff_svc = service_for("tmpl_diff")
+        claim_svc = service_for("tmpl_claim")
+        diff = next(
+            (r for r in store.rows("tmpl_diff") if r.get("差异编号") == diff_no),
+            None)
+        if diff is None:
+            return []
+
+        source_batches = diff_svc.source_batches_of(diff_no)
+        adoptions = {
+            str(a.get("关联批次")): a
+            for a in diff_svc.adoptions_of_diff(diff_no)
+        }
+        affected: list[dict[str, Any]] = []
+        for batch_no in source_batches:
+            claim = claim_svc.claim_of_batch(batch_no)
+            consumed = (
+                str(claim.get("模板版本")) if claim is not None else ""
+            )
+            if not consumed:
+                parsed = [
+                    r for r in store.rows("field_parse")
+                    if str(r.get("关联批次")) == batch_no and r.get("模板版本")
+                ]
+                if parsed:
+                    consumed = str(parsed[0].get("模板版本"))
+            adoption = adoptions.get(batch_no, {})
+            affected.append({
+                "关联批次": batch_no,
+                "采用单号": adoption.get("采用单号", ""),
+                "采用渠道": adoption.get("采用渠道", ""),
+                "真实消费版本": consumed,
+                "模板编号": (
+                    str(claim.get("模板编号")) if claim is not None
+                    else str(adoption.get("模板编号") or "")
+                ),
+                "金额表达式": (
+                    str(claim.get("金额表达式")) if claim is not None
+                    else str(adoption.get("金额表达式") or "")
+                ),
+                "差异字段": diff.get("差异字段", ""),
+            })
+        return affected
+
+    def plan_from_adoption(self, task_no: str, diff_no: str,
+                           coverage_strategy: str,
+                           batch_positions: dict[str, str]) -> tuple[bool, str, dict[str, Any] | None]:
+        """以差异条目定位受影响批次并按真实消费版本建重解析单。"""
+        affected = self.affected_by_diff(diff_no)
+        if not affected:
+            return False, (
+                f"差异 {diff_no} 没有可追溯的来源批次，无需建重解析单"
+            ), None
+        batch_nos = [item["关联批次"] for item in affected]
+        ok, message, task = self.plan_position_range(
+            task_no, f"模板差异 {diff_no} 重解析",
+            coverage_strategy, batch_nos, batch_positions)
+        if not ok or task is None:
+            return ok, message, task
+        task["差异编号"] = diff_no
+        task["真实消费版本"] = ",".join(
+            f"{item['关联批次']}:{item['真实消费版本'] or '未登记'}"
+            for item in affected
+        )
+        task["差异字段"] = affected[0].get("差异字段", "")
+        task["受影响批次"] = ",".join(batch_nos)
+        return True, (
+            f"{message}；真实消费版本 {task['真实消费版本']}，"
+            f"差异字段 {task['差异字段'] or '无'}"
+        ), task

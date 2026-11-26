@@ -56,6 +56,38 @@ class ParseBatchService(BaseModuleService):
             "unreviewed": sum(1 for r in rows if r.get("status") in ("已隔离", "复核中")),
         }
 
+    def template_versions_of_batch(self, intake_batch: str) -> list[str]:
+        """批次发布涉及的模板版本集合：批次记录、批次领取、字段解析三处交叉核对。"""
+        versions: set[str] = set()
+        batch = self._find_by_intake(intake_batch)
+        if batch is not None and batch.get("模板版本"):
+            versions.add(str(batch.get("模板版本")))
+        for claim in store.rows("tmpl_claim"):
+            if (str(claim.get("关联批次")) == intake_batch
+                    and claim.get("status") in ("已领取", "已采纳")
+                    and claim.get("模板版本")):
+                versions.add(str(claim.get("模板版本")))
+        for field in store.rows("field_parse"):
+            if (str(field.get("关联批次")) == intake_batch
+                    and field.get("模板版本")
+                    and field.get("status") in ("解析成功", "部分失败", "解析中")):
+                versions.add(str(field.get("模板版本")))
+        return sorted(versions)
+
+    def assert_single_template(self, intake_batch: str) -> tuple[bool, str]:
+        """同一批次发布只能采用一致的模板数据，不能混用两版表达式产物。"""
+        versions = self.template_versions_of_batch(intake_batch)
+        if len(versions) > 1:
+            return False, (
+                f"批次 {intake_batch} 同时出现模板版本 {versions}，"
+                f"同一批次发布只能采用一致的模板数据，不得把两个表达式的产物"
+                f"拼成同一次解析"
+            )
+        return True, (
+            f"批次 {intake_batch} 模板版本一致：{versions[0]}" if versions
+            else f"批次 {intake_batch} 尚未登记模板版本"
+        )
+
     def refresh_batch_counts(self, intake_batch: str) -> tuple[bool, str, dict[str, Any] | None]:
         """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。"""
         batch = self._find_by_intake(intake_batch)

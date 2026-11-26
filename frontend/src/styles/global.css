@@ -38,6 +38,18 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .create-field { display: block; margin-bottom: 10px; }
 .create-field span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
 .create-field input { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+.create-field select { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: #fff; }
+.modal-hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; line-height: 1.6; }
+.form-message { font-size: 13px; margin: 4px 0 12px; color: #15803d; }
+.form-message.error { color: #b42318; }
+.review-panel { margin-top: 16px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+.review-head { display: flex; justify-content: space-between; align-items: center; }
+.review-head h3 { font-size: 15px; margin: 0 0 8px; }
+.tag-note { color: var(--muted); font-size: 12px; }
+.scope-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+.scope-grid h4 { font-size: 13px; margin: 0 0 6px; }
+.scope-grid p { font-size: 12px; margin: 2px 0; }
+.scope-grid .muted { color: var(--muted); }
 /* DAG 拓扑图 */
 .dag-wrap { position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: #fff; min-height: 320px; user-select: none; }
 .dag-svg { width: 100%; height: 100%; }

@@ -23,6 +23,9 @@ from app.services.dup_fingerprint import DupFingerprintService
 from app.services.sample_review import SampleReviewService
 from app.services.parse_metric import ParseMetricService
 from app.services.tmpl_diff import TmplDiffService
+from app.services.tmpl_grant import TmplGrantService
+from app.services.tmpl_claim import TmplClaimService
+from app.services.tmpl_adopt import TmplAdoptService
 from app.services.intake_audit import IntakeAuditService
 
 SERVICES: dict[str, BaseModuleService] = {
@@ -47,6 +50,9 @@ SERVICES: dict[str, BaseModuleService] = {
     "sample_review": SampleReviewService(),
     "parse_metric": ParseMetricService(),
     "tmpl_diff": TmplDiffService(),
+    "tmpl_grant": TmplGrantService(),
+    "tmpl_claim": TmplClaimService(),
+    "tmpl_adopt": TmplAdoptService(),
     "intake_audit": IntakeAuditService(),
 }
 
